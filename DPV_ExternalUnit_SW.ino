@@ -16,6 +16,176 @@
 #endif
 
 #define pin PB6
+//---- UART Protocol
+HardwareSerial Serial2(PA3, PA2);
+
+// ---- Framing constants ----
+static const uint8_t SYNC1 = 0x55;
+static const uint8_t SYNC2 = 0xAA;
+
+enum RxState : uint8_t { HUNT_SYNC1, HUNT_SYNC2, READ_LABEL, READ_VALUE, READ_CRC };
+static RxState rx_state = HUNT_SYNC1;
+
+//----Timeout helpers ----
+// ---------- PARAM TIMEOUT TRACKING ----------
+#ifndef L_BATT
+// Keep these consistent with the Sender
+const uint8_t L_BATT = 0x01;
+const uint8_t L_TEMP = 0x02;
+const uint8_t L_RPM  = 0x03;
+const uint8_t L_DCME  = 0x03;
+#endif
+
+static const uint32_t PARAM_TIMEOUT_MS = 10000;
+
+struct ParamState {
+  bool     has = false;        // true = value is valid; false = "NULL"
+  uint8_t  val = 0;            // last seen value (ignored if has == false)
+  uint32_t last_ms = 0;        // millis() when we last updated it
+  bool     announced_timeout = false; // to avoid spamming Serial on every loop
+};
+
+static ParamState g_batt, g_temp, g_rpm;
+
+static const char* labelToName(uint8_t label) {
+  switch (label) {
+    case L_BATT: return "Battery";
+    case L_TEMP: return "Temperature";
+    case L_RPM:  return "RPM";
+    default:     return "Unknown";
+  }
+}
+
+static ParamState& stateForLabel(uint8_t label) {
+  switch (label) {
+    case L_BATT: return g_batt;
+    case L_TEMP: return g_temp;
+    case L_RPM:  return g_rpm;
+    default:     return g_batt; // safe fallback, won't be used logically
+  }
+}
+
+// Call this whenever we successfully parse a frame
+static void noteParamSeen(uint8_t label, uint8_t value) {
+  ParamState& ps = stateForLabel(label);
+  ps.val = value;
+  ps.has = true;
+  ps.last_ms = millis();
+  if (ps.announced_timeout) {
+    // One-time "recovered" message after a timeout
+    Serial.print(millis());
+    Serial.print(" --> ");
+    Serial.print(labelToName(label));
+    Serial.println(" recovered");
+    ps.announced_timeout = false;
+  }
+}
+
+// Call this from loop() to invalidate stale values
+static void paramTimeouts_step() {
+  const uint32_t now = millis();
+
+  auto check = [&](const char* name, ParamState& ps) {
+    if (ps.has && (now - ps.last_ms >= PARAM_TIMEOUT_MS)) {
+      // Invalidate -> interpret as "NULL"
+      ps.has = false;
+      ps.announced_timeout = true;
+      Serial.print(millis());
+      Serial.print(" --> ");
+      Serial.print(name);
+      Serial.println(" timeout -> NULL");
+    }
+  };
+
+  check("Battery",     g_batt);
+  check("Temperature", g_temp);
+  check("RPM",         g_rpm);
+}
+
+// (Optional) helper you can call wherever you render to OLED / LCD / etc.
+static void debugPrintCurrentIfYouLike() {
+  auto pr = [&](const char* name, const ParamState& ps) {
+    Serial.print(name);
+    Serial.print(": ");
+    if (ps.has) Serial.println(ps.val);
+    else        Serial.println("NULL");
+  };
+  pr("Battery", g_batt);
+  pr("Temperature", g_temp);
+  pr("RPM", g_rpm);
+}
+//----Timeout helpers ----
+// Define the frame TYPE *before* any function that uses it
+struct RxFrame { uint8_t label; uint8_t value; };
+
+// Manual prototype prevents Arduino from generating a wrong one
+static bool uart_rx_step(RxFrame &out);
+
+// ---- Small CRC-8 (poly 0x07, init 0x00) ----
+static uint8_t crc8_07(const uint8_t* data, size_t len) {
+  uint8_t crc = 0x00;
+  for (size_t i = 0; i < len; ++i) {
+    crc ^= data[i];
+    for (uint8_t b = 0; b < 8; ++b) {
+      crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x07) : (uint8_t)(crc << 1);
+    }
+  }
+  return crc;
+}
+
+static inline const char* labelName(uint8_t label) {
+  switch (label) {
+    case 0x01: return "Battery";
+    case 0x02: return "Temp";
+    case 0x03: return "RPM";
+    default:   return "Unknown";
+  }
+}
+
+static uint8_t rx_label = 0, rx_value = 0;
+
+// Consume at most ONE byte per call; return true only when a full, CRC-valid frame is ready.
+static bool uart_rx_step(RxFrame &out) {
+  if (!Serial2.available()) return false;   // <= 1 byte per loop iteration
+
+  uint8_t byteIn = (uint8_t)Serial2.read();
+
+  switch (rx_state) {
+    case HUNT_SYNC1:
+      if (byteIn == SYNC1) rx_state = HUNT_SYNC2;
+      return false;
+
+    case HUNT_SYNC2:
+      if (byteIn == SYNC2) {
+        rx_state = READ_LABEL;
+      } else if (byteIn != SYNC1) {
+        rx_state = HUNT_SYNC1;
+      }
+      return false;
+
+    case READ_LABEL:
+      rx_label = byteIn;
+      rx_state = READ_VALUE;
+      return false;
+
+    case READ_VALUE:
+      rx_value = byteIn;
+      rx_state = READ_CRC;
+      return false;
+
+    case READ_CRC: {
+      uint8_t calc = crc8_07((uint8_t[]){rx_label, rx_value}, 2);
+      bool ok = (calc == byteIn);
+      rx_state = HUNT_SYNC1;     // always return to hunt
+      if (ok) { out = {rx_label, rx_value}; return true; }
+      return false;
+    }
+  }
+  // Safety fallback
+  rx_state = HUNT_SYNC1;
+  return false;
+}
+//---- UART Protocol
 
 // ===================== OLED CONFIG (U8g2) =====================
 // Hardware SPI pins on Blue Pill: SCK=PA5, MOSI=PA7 (MISO not used by OLED)
@@ -26,9 +196,6 @@ static const uint8_t OLED_RST  = PB0;   // Reset
 
 // SSD1309 128x64 over 4-wire HW SPI (common for many 2.42"/2.7" OLEDs)
 U8G2_SSD1309_128X64_NONAME2_F_4W_HW_SPI u8g2(U8G2_R0, /* cs=*/ OLED_CS, /* dc=*/ OLED_DC, /* reset=*/ OLED_RST);
-
-// Force a UART on USART2 pins: RX=PA3, TX=PA2
-HardwareSerial Serial2(PA3, PA2);
 
 const uint32_t BAUD = 115200;
 const uint8_t LEDPIN = PC13;   // BlackPill LED (active-low on many boards)
@@ -96,14 +263,168 @@ void TIMINPUT_Capture_Falling_IT_callback(void)
   }
 }
 
-void setup() {
-  Serial2.begin(BAUD);                   // Start USART2 on PA2/PA3
-  delay(100);                            // Give the terminal a moment
-  Serial2.println("\r\nUSART2 ready on PA2/PA3 @115200 8N1");
+// ---------- Tile helpers (8x8 tiles) ----------
+static inline uint8_t px2tile(uint8_t px)       { return px >> 3; }          // floor(px/8)
+static inline uint8_t px2tile_ceil(uint8_t px)  { return (px + 7) >> 3; }     // ceil(px/8)
+static inline void pushArea(uint8_t x, uint8_t y, uint8_t w, uint8_t h) {
+  u8g2.updateDisplayArea(px2tile(x), px2tile(y), px2tile_ceil(w), px2tile_ceil(h));
+}
+
+// ---------- Layout (adjust to taste) ----------
+static const uint8_t W = 128, H = 64;
+
+// Top row (two small fields)
+static const uint8_t TMP_X=2,  TMP_Y=0,  TMP_W=62, TMP_H=16;     // "T: 23.4C"
+static const uint8_t BAT_X=66, BAT_Y=0,  BAT_W=60, BAT_H=16;     // "Bat: 85%"
+
+// Middle/bottom rows
+static const uint8_t RPM_X=2,  RPM_Y=18, RPM_W=124, RPM_H=16;    // "RPM: 1234"
+static const uint8_t DC_X=8,   DC_Y=36, DC_W=112, DC_H=22;       // bar + XOR text
+
+// ---------- Common helpers ----------
+static void clearRect(uint8_t x, uint8_t y, uint8_t w, uint8_t h) {
+  u8g2.setDrawColor(0);
+  u8g2.drawBox(x, y, w, h);
+  u8g2.setDrawColor(1);  // restore for normal drawing
+}
+
+// Choose a small, readable font once per widget draw.
+// (Change to any u8g2 font you prefer.)
+static void setSmallFont() { u8g2.setFont(u8g2_font_6x12_tf); }
+
+// Center a string horizontally inside a rect; returns baseline y centered vertically for given rect.
+static int16_t centeredBaselineY(uint8_t y, uint8_t h) {
+  // Using font ascent for baseline; visually centered for 6x12 class fonts
+  return y + (h + u8g2.getAscent())/2 - 1;
+}
+
+// ============= 1) Duty Cycle =============
+void renderDutyCycle(uint8_t duty /*0..100*/) {
+  if (duty > 100) duty = 100;
+
+  clearRect(DC_X, DC_Y, DC_W, DC_H);
+  setSmallFont();
+
+  // Bar geometry inside its rect
+  const uint8_t barY = DC_Y + (DC_H - 14)/2;     // 14px tall bar
+  const uint8_t barH = 14;
+  const uint8_t barW = DC_W - 2;                 // inner width: leave 1px margins
+  const uint8_t barX = DC_X + 1;
+
+  // Frame
+  u8g2.drawFrame(DC_X, barY, DC_W, barH);
+
+  // Fill
+  uint16_t fillW = (uint16_t)((uint32_t)barW * duty / 100);
+  if (fillW) u8g2.drawBox(barX, barY + 1, fillW, barH - 2);
+
+  // XOR text centered on the bar
+  char msg[8];
+  snprintf(msg, sizeof(msg), "%u%%", duty);
+  int16_t tw = u8g2.getStrWidth(msg);
+  int16_t tx = DC_X + (DC_W - tw)/2;
+  int16_t ty = centeredBaselineY(barY, barH);
+
+  u8g2.setFontMode(0);     // transparent glyphs
+  u8g2.setDrawColor(2);    // XOR
+  u8g2.drawStr(tx, ty, msg);
+  u8g2.setDrawColor(1);    // back to normal
+
+  pushArea(DC_X, DC_Y, DC_W, DC_H);
+}
+
+// ============= 2) Battery % =============
+void renderBattery(ParamState p) {
+  clearRect(BAT_X, BAT_Y, BAT_W, BAT_H);
+  setSmallFont();
+
+  char s[16];
+
+  if (p.has) {
+    snprintf(s, sizeof(s), "Bat: %u%%", p.val);
+  } else {
+    snprintf(s, sizeof(s), "Bat: ??%%");
+  }
+
+  int16_t ty = centeredBaselineY(BAT_Y, BAT_H);
+
+  u8g2.drawStr(BAT_X, ty, s);
+  pushArea(BAT_X, BAT_Y, BAT_W, BAT_H);
+}
+
+// ============= 3) Temperature (°C) =============
+void renderTemperature(ParamState t) {
+  clearRect(TMP_X, TMP_Y, TMP_W, TMP_H);
+  setSmallFont();
+
+  char s[20];
   
+  if (t.has) {
+    snprintf(s, sizeof(s), "T: %uC", t.val);
+  } else {
+    snprintf(s, sizeof(s), "T: ???");
+  }
+  int16_t ty = centeredBaselineY(TMP_Y, TMP_H);
+
+  u8g2.drawStr(TMP_X, ty, s);
+  pushArea(TMP_X, TMP_Y, TMP_W, TMP_H);
+}
+
+// ============= 4) RPM =============
+void renderRPM(ParamState r) {
+  clearRect(RPM_X, RPM_Y, RPM_W, RPM_H);
+  setSmallFont();
+
+  char s[24];
+
+  if (r.has) {
+    uint16_t Scaledrpm = r.val * 15;
+    snprintf(s, sizeof(s), "RPM: %u", Scaledrpm);
+  } else {
+    snprintf(s, sizeof(s), "RPM: ???");
+  }
+  int16_t ty = centeredBaselineY(RPM_Y, RPM_H);
+
+  u8g2.drawStr(RPM_X, ty, s);
+  pushArea(RPM_X, RPM_Y, RPM_W, RPM_H);
+}
+
+// Packs and sends one frame: [0x55, 0xAA, L_DCME, payload, crc]
+static void sendDC_MotorEnable(uint8_t duty_0_100, bool motorEnable) {
+  // Saturate duty into 0..100 and pack into 7 bits
+  if (duty_0_100 > 100) duty_0_100 = 100;
+
+  uint8_t payload = (uint8_t)(duty_0_100 & 0x7F);
+  if (motorEnable) payload |= 0x80;  // set MSB if enabled
+
+  // Compute CRC over [label, value] with your existing crc8_07()
+  uint8_t label = L_DCME;
+  uint8_t buf[2] = { label, payload };
+  uint8_t crc = crc8_07(buf, 2);
+
+  // Emit the frame over the same UART you already use
+  uint8_t frame[5] = { SYNC1, SYNC2, label, payload, crc };
+  Serial2.write(frame, sizeof(frame));
+
+  Serial.print(millis());
+  Serial.print(" --> ");
+  Serial.print("Sent frame: DC=");
+  Serial.print( payload & 0x7F );
+  Serial.print("Motor: ");
+  Serial.println( (payload & 0b10000000)?"Enabled":"Disabled");
+}
+
+void setup() {
   // OLED init
   u8g2.begin();
-  u8g2.setFont(u8g2_font_6x12_tf); // Compact readable font
+  u8g2.setBusClock(8000000);  // SPI example
+  u8g2.clearBuffer();
+  u8g2.sendBuffer();          // blank once
+
+  Serial.begin(115200);        // USB debug
+  Serial2.begin(115200);       // UART from Board B
+  delay(500);
+  Serial.println("Receiver is up");
 
   // Automatically retrieve TIM instance and channelRising associated to pin
   // This is used to be compatible with all STM32 series automatically.
@@ -155,49 +476,49 @@ void setup() {
   digitalWrite(LEDPIN, LOW); // LED on (active low)
 
   // Initial splash
-  drawOLED(0);
+  renderDutyCycle(0);
 }
+
+uint32_t PreviousDutycycle = 0;
+uint32_t LastDCDebugPrintTimeStamp = 0;
+uint32_t LastDCOLEDTimeStamp = 0;
+
+static void sendDC_MotorEnable(uint8_t duty_0_100, bool motorEnable);
 
 void loop() {
-  uint32_t PreviousDutycycle = 0;
 
-  //Serial2.print((String)"F = " + FrequencyMeasured);
-  //Serial2.println((String)"    D = " + DutycycleMeasured + "%\n");
-  //digitalWrite(LEDPIN, !digitalRead(LEDPIN)); // Toggle LED
-  
-  if (DutycycleMeasured != PreviousDutycycle) {
-    drawOLED(DutycycleMeasured);
+  if ( (millis() - LastDCDebugPrintTimeStamp) > 500UL ) {
+    Serial.print("D = ");
+    Serial.println(DutycycleMeasured);
+    digitalWrite(LEDPIN, !digitalRead(LEDPIN)); // Toggle LED
+    LastDCDebugPrintTimeStamp = millis();
   }
-  delay(2);
-}
-
-// ===================== OLED RENDERING =====================
-void drawOLED(uint16_t duty) {
-  // Progress bar geometry
-  const int16_t W = 128;
-  const int16_t H = 64;
-  const int16_t marginX = 8;
-  const int16_t barY = 40;
-  const int16_t barH = 14;
-  const int16_t barW = W - 2 * marginX;
-  int16_t fillW = (int16_t)(( (uint32_t)barW * duty ) / 100);
-
-  u8g2.firstPage();
-  do {
-    // Duty text
-    u8g2.setCursor(8, 28);
-    u8g2.print("DC: ");
-    u8g2.print(duty);
-    u8g2.print("%");
-    // Bar frame
-    u8g2.drawFrame(marginX, barY, barW, barH);
-    // Fill (stretch/shrink with duty)
-    if (fillW > 0) {
-      u8g2.drawBox(marginX + 1, barY + 1, fillW - (fillW>1?1:0), barH - 2);
+  
+  if ( millis() - LastDCOLEDTimeStamp > 20 ) {
+    if (DutycycleMeasured != PreviousDutycycle) {
+      renderDutyCycle(DutycycleMeasured);
     }
+    sendDC_MotorEnable(DutycycleMeasured, 1);
+    LastDCOLEDTimeStamp = millis();
+  }
 
-    // End caps as simple chevrons
-    u8g2.drawTriangle(marginX-3, barY+barH/2, marginX, barY, marginX, barY+barH);
-    u8g2.drawTriangle(marginX+barW+3, barY+barH/2, marginX+barW, barY, marginX+barW, barY+barH);
-  } while (u8g2.nextPage());
-}
+  // 1) Drain at most ONE byte of UART work this iteration
+  RxFrame f;
+  if (uart_rx_step(f)) {
+    Serial.print(millis());
+    Serial.print(" --> ");
+    Serial.print(labelName(f.label));
+    Serial.print(" = ");
+    Serial.println(f.value);
+
+    // Record that we saw this parameter now
+    noteParamSeen(f.label, f.value);
+  }
+  paramTimeouts_step(); // invalidate stale values -> becomes "NULL"
+
+  renderBattery(g_batt);
+  renderTemperature(g_temp);
+  renderRPM(g_rpm);
+
+  //delay( 10 );
+  }
