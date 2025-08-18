@@ -28,13 +28,12 @@ static RxState rx_state = HUNT_SYNC1;
 
 //----Timeout helpers ----
 // ---------- PARAM TIMEOUT TRACKING ----------
-#ifndef L_BATT
+
 // Keep these consistent with the Sender
 const uint8_t L_BATT = 0x01;
 const uint8_t L_TEMP = 0x02;
 const uint8_t L_RPM  = 0x03;
-const uint8_t L_DCME  = 0x03;
-#endif
+const uint8_t L_DCME  = 0x04;
 
 static const uint32_t PARAM_TIMEOUT_MS = 10000;
 
@@ -45,13 +44,14 @@ struct ParamState {
   bool     announced_timeout = false; // to avoid spamming Serial on every loop
 };
 
-static ParamState g_batt, g_temp, g_rpm;
+static ParamState g_batt, g_temp, g_rpm, g_dutycycle;
 
 static const char* labelToName(uint8_t label) {
   switch (label) {
     case L_BATT: return "Battery";
     case L_TEMP: return "Temperature";
     case L_RPM:  return "RPM";
+    case L_DCME: return "DutyCycle";
     default:     return "Unknown";
   }
 }
@@ -61,10 +61,10 @@ static ParamState& stateForLabel(uint8_t label) {
     case L_BATT: return g_batt;
     case L_TEMP: return g_temp;
     case L_RPM:  return g_rpm;
+    case L_DCME: return g_dutycycle;
     default:     return g_batt; // safe fallback, won't be used logically
   }
 }
-
 // Call this whenever we successfully parse a frame
 static void noteParamSeen(uint8_t label, uint8_t value) {
   ParamState& ps = stateForLabel(label);
@@ -266,8 +266,14 @@ void TIMINPUT_Capture_Falling_IT_callback(void)
 // ---------- Tile helpers (8x8 tiles) ----------
 static inline uint8_t px2tile(uint8_t px)       { return px >> 3; }          // floor(px/8)
 static inline uint8_t px2tile_ceil(uint8_t px)  { return (px + 7) >> 3; }     // ceil(px/8)
-static inline void pushArea(uint8_t x, uint8_t y, uint8_t w, uint8_t h) {
-  u8g2.updateDisplayArea(px2tile(x), px2tile(y), px2tile_ceil(w), px2tile_ceil(h));
+
+// replaces pushArea()
+static inline void pushAreaPx(uint8_t x, uint8_t y, uint8_t w, uint8_t h) {
+  uint8_t tx = x >> 3;                         // tile x
+  uint8_t ty = y >> 3;                         // tile y
+  uint8_t tw = ((x & 7) + w + 7) >> 3;         // tile width  (ceil((x%8 + w)/8))
+  uint8_t th = ((y & 7) + h + 7) >> 3;         // tile height (ceil((y%8 + h)/8))
+  u8g2.updateDisplayArea(tx, ty, tw, th);
 }
 
 // ---------- Layout (adjust to taste) ----------
@@ -279,7 +285,7 @@ static const uint8_t BAT_X=66, BAT_Y=0,  BAT_W=60, BAT_H=16;     // "Bat: 85%"
 
 // Middle/bottom rows
 static const uint8_t RPM_X=2,  RPM_Y=18, RPM_W=124, RPM_H=16;    // "RPM: 1234"
-static const uint8_t DC_X=8,   DC_Y=36, DC_W=112, DC_H=22;       // bar + XOR text
+static const uint8_t DC_X=128-56,   DC_Y=64-16, DC_W=56, DC_H=16;       // triangle area
 
 // ---------- Common helpers ----------
 static void clearRect(uint8_t x, uint8_t y, uint8_t w, uint8_t h) {
@@ -302,36 +308,38 @@ static int16_t centeredBaselineY(uint8_t y, uint8_t h) {
 void renderDutyCycle(uint8_t duty /*0..100*/) {
   if (duty > 100) duty = 100;
 
-  clearRect(DC_X, DC_Y, DC_W, DC_H);
-  setSmallFont();
+  // ---- Geometry (half-width triangle) ----
+  const uint8_t triW  = 54;                   // half of 128 px
+  const uint8_t barH  = 14;                   // tile-friendly height
+  const uint8_t barY  = DC_Y + (DC_H - barH)/2;
+  const uint8_t triX  = DC_X;                 // left-aligned; center if you prefer:
+  // const uint8_t triX = DC_X + (DC_W - triW)/2;
 
-  // Bar geometry inside its rect
-  const uint8_t barY = DC_Y + (DC_H - 14)/2;     // 14px tall bar
-  const uint8_t barH = 14;
-  const uint8_t barW = DC_W - 2;                 // inner width: leave 1px margins
-  const uint8_t barX = DC_X + 1;
+  // Clear only this region
+  clearRect(triX, barY, triW, barH);
+  u8g2.setDrawColor(1);
 
-  // Frame
-  u8g2.drawFrame(DC_X, barY, DC_W, barH);
+  // ---- Fill: left -> right, mirrored triangle ----
+  // x_cut scales with duty (width-proportional). For area-proportional, use sqrt mapping.
+  uint16_t x_cut = (uint16_t)((uint32_t)triW * duty / 100);
 
-  // Fill
-  uint16_t fillW = (uint16_t)((uint32_t)barW * duty / 100);
-  if (fillW) u8g2.drawBox(barX, barY + 1, fillW, barH - 2);
+  const uint8_t y_bottom = barY + barH - 1;
+  for (uint16_t dx = 0; dx < x_cut; ++dx) {
+    // Hypotenuse runs from (triX+triW-1, barY) to (triX, y_bottom)
+    // For a given x = triX + dx, the top y is higher when dx is small.
+    uint8_t y_top = barY + (uint16_t)((uint32_t)barH * (triW - 1 - dx) / triW);
+    u8g2.drawVLine(triX + dx, y_top, y_bottom - y_top + 1);
+  }
 
-  // XOR text centered on the bar
-  char msg[8];
-  snprintf(msg, sizeof(msg), "%u%%", duty);
-  int16_t tw = u8g2.getStrWidth(msg);
-  int16_t tx = DC_X + (DC_W - tw)/2;
-  int16_t ty = centeredBaselineY(barY, barH);
+  // ---- Outline (right-angled at the right) ----
+  u8g2.drawVLine(triX + triW - 1, barY, barH);             // right side
+  u8g2.drawHLine(triX, y_bottom+1, triW);                    // bottom
+  u8g2.drawLine (triX + triW - 1, barY, triX, y_bottom);   // hypotenuse
 
-  u8g2.setFontMode(0);     // transparent glyphs
-  u8g2.setDrawColor(2);    // XOR
-  u8g2.drawStr(tx, ty, msg);
-  u8g2.setDrawColor(1);    // back to normal
-
-  pushArea(DC_X, DC_Y, DC_W, DC_H);
+  // Push only this area
+  pushAreaPx(triX, barY, triW, barH);
 }
+
 
 // ============= 2) Battery % =============
 void renderBattery(ParamState p) {
@@ -349,7 +357,7 @@ void renderBattery(ParamState p) {
   int16_t ty = centeredBaselineY(BAT_Y, BAT_H);
 
   u8g2.drawStr(BAT_X, ty, s);
-  pushArea(BAT_X, BAT_Y, BAT_W, BAT_H);
+  pushAreaPx(BAT_X, BAT_Y, BAT_W, BAT_H);
 }
 
 // ============= 3) Temperature (°C) =============
@@ -367,7 +375,7 @@ void renderTemperature(ParamState t) {
   int16_t ty = centeredBaselineY(TMP_Y, TMP_H);
 
   u8g2.drawStr(TMP_X, ty, s);
-  pushArea(TMP_X, TMP_Y, TMP_W, TMP_H);
+  pushAreaPx(TMP_X, TMP_Y, TMP_W, TMP_H);
 }
 
 // ============= 4) RPM =============
@@ -386,7 +394,7 @@ void renderRPM(ParamState r) {
   int16_t ty = centeredBaselineY(RPM_Y, RPM_H);
 
   u8g2.drawStr(RPM_X, ty, s);
-  pushArea(RPM_X, RPM_Y, RPM_W, RPM_H);
+  pushAreaPx(RPM_X, RPM_Y, RPM_W, RPM_H);
 }
 
 // Packs and sends one frame: [0x55, 0xAA, L_DCME, payload, crc]
@@ -494,7 +502,7 @@ void loop() {
     LastDCDebugPrintTimeStamp = millis();
   }
   
-  if ( millis() - LastDCOLEDTimeStamp > 20 ) {
+  if ( millis() - LastDCOLEDTimeStamp > 5 ) {
     if (DutycycleMeasured != PreviousDutycycle) {
       renderDutyCycle(DutycycleMeasured);
     }
